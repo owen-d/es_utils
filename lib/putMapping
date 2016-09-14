@@ -1,0 +1,88 @@
+#!/usr/bin/env node
+
+'use strict';
+
+require('colors');
+var request = require('request');
+var Optimist = require('optimist');
+
+
+function putMapping(argv, done) {
+  argv = parseArgs(argv)
+
+  var mappingUrl = [argv.url, argv.index, argv.type, '_mapping'].join('/');
+
+  request({
+    method: 'PUT',
+    url: mappingUrl,
+    json: argv.mapping,
+  }, function(err, resp, body) {
+    if (err || resp && resp.statusCode !== 200) {
+      console.error('Something went wrong'.red);
+      return done(err || resp.body);
+    }
+
+    console.log('successfully put new mapping to %s'.green, mappingUrl);
+    return done();
+  });
+}
+
+
+function parseArgs(args) {
+  args = new Optimist()
+    .usage('create/update elasticsearch mappings'.yellow)
+
+    .options('i', {
+      alias: 'index',
+      describe: 'the elasticsearch index'.yellow,
+      demand: true
+    })
+
+    .options('t', {
+      alias: 'type',
+      describe: 'the elasticsearch type'.yellow,
+      demand: true
+    })
+
+    .options('u', {
+      alias: 'url',
+      describe: 'the elasticsearch server url'.yellow,
+      demand: true
+    })
+
+    .options('mapping', {
+      describe: 'path to JSON representation of mapping'.yellow,
+      demand: true,
+      check: function(mapping) {
+        return Object.prototype.toString.call(require(mapping)) === '[object Object]';
+      }
+    })
+
+    .parse(args);
+
+    args.mapping = require(args.mapping);
+    if (typeof args.mapping !== 'object') {
+      console.error('invalid mapper');
+      process.exit(1)
+    }
+
+    return args;
+}
+
+
+
+// error handler
+function handleError(err) {
+  if (err) {
+    console.error(err);
+    process.exit(1);
+  }
+}
+
+
+module.exports = putMapping;
+// use as cli if not 'required'
+if (!module.parent) {
+    putMapping(process.argv, handleError);
+}
+

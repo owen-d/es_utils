@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+
+'use strict';
+
+require('colors');
+
+var request = require('request');
+var Optimist = require('optimist');
+
+var example = './put-settings -i index_name -u https://elasticurl --settings="`cat ./settings.json`"';
+
+function putSettings(argv, done) {
+  argv = parseArgs(argv)
+  var settingsUrl = [argv.url,argv.index,'_settings'].join('/');
+
+  request({
+      method: 'PUT',
+      url: settingsUrl,
+      json: JSON.parse(argv.settings)
+  }, function (err, resp, body) {
+
+      if (err || resp && resp.statusCode !== 200) {
+          console.error('Something went wrong'.red);
+          return done(err || resp.body);
+          process.exit(1);
+      }
+
+      console.log('successfully put new settings to %s'.green, settingsUrl);
+      return done();
+  });
+}
+
+function parseArgs(args) {
+  var argv = new Optimist()
+   .usage(('create and update elasticsearch index settings\n'+example).green)
+
+   .options('i',{
+       alias: 'index',
+       describe: 'the elasticsearch index'.yellow,
+       demand: true
+   })
+
+   .options('u',{
+       alias: 'url',
+       describe: 'the elasticsearch server url'.yellow,
+       demand: true
+   })
+
+   .options('s',{
+      alias: 'settings',
+      describe: 'JSON representation of settings'.yellow,
+      demand: true,
+      check: function (mapping) {
+          // validate mapping is a json object
+          return Object.prototype.toString.call(JSON.parse(mapping)) === '[object Object]';
+      }
+   })
+
+   .parse(args);
+
+   return argv;
+}
+
+
+
+// error handler
+function handleError(err) {
+  if (err) console.error(err);
+  process.exit(err ? 1 : 0);
+}
+
+module.exports = putSettings;
+// use as cli if not 'required'
+if (!module.parent) {
+  putSettings(process.argv, handleError);
+}

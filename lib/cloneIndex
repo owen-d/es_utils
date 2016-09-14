@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+
+'use strict';
+
+require('colors');
+
+var uuid    = require('node-uuid');
+var async   = require('async');
+var request = require('request');
+var Optimist = require('optimist');
+
+// snag first key of obj
+function getFirst(o){
+  var firstKey = null;
+  Object.keys(o).forEach(function(key){
+    firstKey = !firstKey ? key : firstKey;
+  });
+  return o[firstKey];
+}
+
+
+// error handler
+function handleError(err) {
+  if (err) {
+    console.error(err);
+    process.exit(1);
+  }
+}
+
+
+function cloneIndex(argv, done) {
+  argv = parseArgs(argv);
+  done = done || _.noop;
+
+  var oldIndex = argv.oldIndex;
+  var newIndex = argv.newIndex;
+  var oldESURL = argv.oldESURL;
+  var newESURL = argv.newESURL || oldESURL;
+  var newIndexUrl = [newESURL,newIndex].join('/');
+
+  // fetch oldIndexSettings
+  function getOldIndexSettings(next) {
+    var strings = [oldESURL,oldIndex,'_settings'];
+    console.log(argv.oldESURL)
+    var oldIndexSettingsUrl = strings.join('/');
+
+    console.log('Getting Old Index Settings'.yellow, oldIndexSettingsUrl);
+
+    request({
+      method: 'GET',
+      url: oldIndexSettingsUrl
+    }, function (err, res, body){
+
+      var error = err || res && res.statusCode > 200;
+
+      if (error) {
+        return done(body);
+      }
+
+      if (argv.verbose) {
+        console.log('Old Index Settings'.yellow);
+        console.log(JSON.stringify(body,null,4));
+      }
+
+      return next(null, getFirst(JSON.parse(body)));
+
+    });
+  }
+
+  // fetch old index mappings
+  function getOldMappings(settings, next) {
+    var oldMappingUrl = [oldESURL,oldIndex,'_mapping'].join('/');
+
+    if (argv.skipMapping) {
+      console.log('Skipping copy phase for old mapping'.yellow);
+      return next(null, settings);
+    }
+
+    console.log('Getting old mappings'.yellow, oldMappingUrl);
+
+    request({
+      method: 'GET',
+      url: oldMappingUrl
+    }, function (err, res, body) {
+
+      var error = err || res && res.statusCode > 200;
+
+      if (error) {
+        return done(body);
+      }
+
+      if (argv.verbose) {
+        console.log('Old Mappings'.yellow);
+        console.log(JSON.stringify(body,null,4));
+      }
+
+      settings.mappings = getFirst(JSON.parse(body)).mappings;
+      return next(null, settings);
+
+    });
+  }
+
+  // create new index with old settings
+  function createNewIndexWithOldSettings(settings, next) {
+
+    console.log('Creating New Index'.yellow, newIndexUrl);
+
+    if (argv.verbose) {
+      console.log('New Index Settings'.yellow);
+      console.log(JSON.stringify(settings,null,4));
+    }
+
+    request({
+      method: 'PUT',
+      url: newIndexUrl,
+      json: settings
+    }, function (err, res, body){
+
+      var error = err || res && res.statusCode > 201;
+
+      if (error) {
+        return done(body);
+      }
+
+      return next(null, body);
+
+    });
+
+  }
+
+
+  // init
+  async.waterfall([
+    getOldIndexSettings,
+    getOldMappings,
+    createNewIndexWithOldSettings
+    ], function (err, results) {
+
+      if (err) {
+        return done(err);
+      }
+
+      console.log('sucessfully copied index to %s'.green,newIndexUrl);
+
+      if (argv.verbose) {
+        console.log(JSON.stringify(results, null , 4));
+      }
+
+      return done(null, {index: newIndex});
+    });
+}
+
+function parseArgs(args) {
+  var argv = new Optimist()
+    .usage('clone elasticsearch index'.green)
+
+    .options('o',{
+      alias: 'oldIndex',
+      describe: 'the old elasticsearch index'.yellow,
+      demand: true
+    })
+
+    .options('n',{
+      alias: 'newIndex',
+      describe: 'the new elasticsearch index (defaults to newly generated uuid.v4)'.yellow,
+      demand: false,
+      default: uuid.v4()
+    })
+
+    .options('s',{
+      alias: 'skipMapping',
+      describe: 'skip copying the mapping from old index'.yellow,
+      boolean: true,
+      demand: false,
+      default: false
+    })
+
+    .options('u',{
+      alias: 'oldESURL',
+      describe: 'the originating elasticsearch server url'.yellow,
+      demand: true,
+      default: 'http://localhost:9200'
+    })
+
+    .options('nurl',{
+      alias: 'newESURL',
+      describe: 'the destination elasticsearch server url (defaults to --oldESURL)'.yellow,
+      demand: false
+    })
+
+    .options('v',{
+      alias: 'verbose',
+      describe: 'log extra information'.yellow,
+      boolean: true,
+      demand: false
+    })
+
+    .parse(args);
+
+  return argv;
+}
+
+module.exports = cloneIndex
+
+// use as cli if not 'required'
+if (!module.parent) {
+  cloneIndex(process.argv, handleError)
+}

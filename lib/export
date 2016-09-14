@@ -1,0 +1,298 @@
+#!/usr/bin/env node
+
+'use strict';
+require('colors');
+
+var _ = require('lodash');
+var knex = require('knex');
+var through2 = require('through2');
+var elasticsearch = require('elasticsearch');
+var bb = require('bluebird');
+var request = bb.promisifyAll(require('request'));
+var Optimist = require('optimist');
+
+
+
+var example = ' ./export -q "`cat ./example_query.sql`" -u http://localhost:9200 -i <INDEX || ALIAS> -t <TYPE> -m <path to mapper fn (js)> --id=<ID_FIELD> --mysqlHost=localhost --mysqlUser=root --mysqlPass=abracadabra --mysqlDb=database';
+
+function main(optimist) {
+
+  var argv = optimist
+    .usage('stream sql queries into elasticsearch bulk indexing\n'+example.green)
+
+    .options('q',{
+      alias: 'query',
+      describe: 'mysql query'.yellow,
+      demand: true
+    })
+
+    .options('b', {
+      alias: 'batchSize',
+      describe: '# of docs/batch index',
+      default: 100
+    })
+
+    .options('u',{
+      alias: 'url',
+      describe: 'elasticsearch host'.yellow,
+      default: 'http://127.0.0.1:9200'
+    })
+
+    .options('i',{
+      alias:'index',
+      describe: 'es index'.yellow,
+      demand: true
+    })
+
+    .options('id', {
+      describe: 'id field to use in index'.yellow,
+      demand: true
+    })
+
+    .options('t',{
+        alias:'type',
+        describe: 'es type'.yellow,
+        demand: true
+    })
+
+    .options('m', {
+      alias: 'mapper',
+      describe: 'path to mapper'.yellow,
+    })
+
+    .options('e', {
+      alias: 'exit on indexing errors',
+      describe: 'exit on error',
+      default: false
+    })
+
+    .options('mysqlHost', {
+      demand: true
+    })
+
+    .options('mysqlUser', {
+      demand: true
+    })
+
+    .options('mysqlPass', {
+      demand: true
+    })
+
+    .options('mysqlDb', {
+      demand: true
+    })
+
+    .options('retryCount', {
+      describe: '# of times to retry ops from timeout errors',
+      default: 3
+    })
+
+    .options('esTimeout', {
+      describe: 'timeout in seconds for elasticsearch',
+      default: 60
+    })
+    .argv;
+
+
+  // MAIN ---------------------------------------------------------------------------------------------------------
+
+    var db = knex({
+      client: 'mysql',
+      connection: {
+        host: argv.mysqlHost,
+        user: argv.mysqlUser,
+        password: argv.mysqlPass,
+        database: argv.mysqlDb,
+        timezone: 'UTC'
+      }
+    });
+
+    // placeholder variable for es client.
+    var client;
+
+    // placeholder variable count: total documents uploaded
+    var count = 0;
+
+    client = new elasticsearch.Client({
+      host: argv.u
+    });
+
+    // mapper instantiation
+    if (argv.m) {
+      let pathToMapper = path.isAbsolute(argv.m) ? argv.m : path.join(__dirname, argv.m);
+      try {
+        argv.m = require(pathToMapper);
+      } catch (e) {
+        console.error('must include a valid mapper path');
+        throw e;
+      }
+    } else {
+      argv.m = _.identity;
+    }
+    if (typeof argv.m !== 'function') {
+      console.error('invalid mapper');
+      process.exit(1)
+    }
+
+    console.log('using query:\n%s', argv.q);
+
+
+
+    process.on('uncaughtException', function(err) {
+      console.error('uncaught exception! Don\'t forget to update the refresh intervals!');
+      console.log(err.stack);
+      throw err;
+    });
+
+    return modifyRefreshInterval(-1)
+      .then(function() {
+        var streams = [db.raw(argv.q), through2.obj(createBulkInsert), through2.obj.apply(through2, new FlushToElastic(argv.b))];
+
+
+        var pipeline = _.reduce(streams, function(accum, stream, index) {
+
+          function errhandler(err) {
+            console.error('error:'.red, err);
+            if (argv.e) {
+              throw e;
+            }
+          }
+
+          // attach errhandler to initial stream
+          if (index === 0) {
+            accum.on('error', errhandler);
+          }
+
+          stream.on('error', errhandler);
+          return accum.pipe(stream);
+        });
+      });
+
+  // UTILS --------------------------------------------------------------------------------------
+
+
+
+  function modifyRefreshInterval(interval, cb) {
+    cb = cb || _.noop;
+
+    console.log('attempting to set refresh_interval to %s', interval)
+    var prefix = argv.u.indexOf('http') !== -1 ? '' : 'http://'
+
+    return request.putAsync({
+      url: prefix + argv.u + '/' + argv.i + '/_settings',
+      json: {
+        index: {
+          refresh_interval: interval + ''
+        }
+      }
+    })
+      .then(function (res){
+        res = res[0]
+        if (res && res.statusCode !== 200) {
+          console.log('res code %d', res.statusCode, res.body)
+          console.error('failed to put refresh interval %s'.red, interval);
+          process.exit(1);
+        } else {
+          console.log('updated refresh interval to %s'.green, interval);
+          cb();
+        }
+
+    })
+  }
+
+  function createBulkInsert(row, enc, cb) {
+
+    var OpTemplate = {
+      index: {
+        _index: argv.i,
+        _type: argv.t,
+        _id: row[argv.id]
+      }
+    };
+
+    var output = [OpTemplate, argv.m(row)];
+    this.push(output);
+
+    cb();
+  }
+
+  function FlushToElastic(steps) {
+    // have finish fire a cb after done (important for when used as an imported module)
+    let finish = _.bind(modifyRefreshInterval, null, '1s', process.exit.bind(process, 0));
+    var bufferedOps = [];
+
+    function recursiveBulk(cb, body, tries=0) {
+      client.bulk({
+        body: body,
+        timeout: argv.esTimeout + 's'
+      }, function(err) {
+        if (err && (err.status === 408 || err.status === 504)) {
+          if (tries === argv.retryCount) {
+            console.error('hit err:', err);
+            throw err;
+          } else {
+            // attempt to retry
+            console.log(`timeout w/ code ${err.status}, retrying upload.`);
+            return recursiveBulk(cb, body, ++tries);
+          }
+        }
+        else if (err) {
+          console.error('hit err:', err);
+          throw err;
+        } else {
+          cb();
+        }
+      });
+    }
+
+    function flushToElastic(cb) {
+      var body = _.flatten(bufferedOps);
+
+      // no ops to send to elastic, exit early.
+      if (!body.length) {
+        console.log('no operations to send to elastic');
+        return cb();
+      }
+
+      recursiveBulk(() => {
+        console.log('%d documents processed', count+=bufferedOps.length);
+        bufferedOps = [];
+        cb();
+      }, body)
+    }
+
+    // we return an array so that both functions are closure scoped with access to the bufferedOpts variable.
+    return [
+      function handler(op, enc, cb) {
+        bufferedOps.push(op);
+
+        // flush to elastic if internal buffer hits step count.
+        if (bufferedOps.length === steps) {
+          flushToElastic(cb);
+        } else {
+          cb();
+        }
+      },
+      function(cb) {
+        // pass finish as callback to flush and then execute the through2 callback
+        flushToElastic(finish);
+        cb();
+      }
+    ];
+  }
+}
+
+function init(args) {
+  var hasArgs = Array.isArray(args) && args.length > 0;
+  var optimist = hasArgs ? require('optimist')(args) : require('optimist');
+  main(optimist);
+}
+
+module.exports = {
+  init: init,
+  main: main
+};
+
+if (module.parent === null) {
+  init();
+}

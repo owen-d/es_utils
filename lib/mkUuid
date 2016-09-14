@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+const uuid = require('node-uuid');
+
+process.stdout.write(uuid.v4())

@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+
+'use strict';
+
+require('colors');
+
+var url     = require('url');
+var Optimist = require('optimist');
+var _ = require('lodash');
+var bb = require('bluebird');
+var request = bb.promisifyAll(require('request'));
+
+
+function rotateAlias(argv, done) {
+  done = done || function(err) {
+    if (err) {
+      console.error(err);
+      process.exit(1);
+    }
+  };
+  argv = parseArgs(argv);
+  let oldIndex;
+
+  request.getAsync({
+    url: argv.url + '/' + argv.alias + '/_alias',
+    json: true
+  })
+    .then(function(res) {
+      var resp = res[0];
+      if (resp.statusCode === 404) {
+        return null;
+      }
+      if (resp.statusCode !== 200) {
+        throw new Error(resp.body.toString().red);
+      }
+      if (_.keys(resp.body).length !== 1) {
+        console.error(JSON.stringify(resp.body,null,4));
+        throw new Error('wrong # of current aliases'.red)
+      }
+
+
+      oldIndex = _.keys(resp.body)[0];
+      return oldIndex;
+    })
+    .then(function(oldIndex) {
+      var options = {
+        url: argv.url+'/_aliases',
+        json: {
+          actions:[{
+            add: {
+              alias: argv.alias,
+              index: argv.index
+            }
+          }]
+        }
+      };
+
+      if (oldIndex) {
+        options.json.actions.push({
+          remove: {
+            alias: argv.alias,
+            index: oldIndex
+          }
+        });
+      }
+      return request.postAsync(options)
+    })
+    .then(function(res) {
+      res = res[0];
+      var body = res.body;
+
+      if (res.statusCode !== 200 || body.error) {
+        console.error(JSON.stringify(body,null,4));
+        return done(err, body);
+      }
+      console.log('Successfully rotated alias %s from index %s to index %s'.green, argv.alias, oldIndex, argv.index);
+      return done();
+
+    })
+    .catch(done);
+}
+
+
+function parseArgs(argv) {
+  return new Optimist()
+  .options('a',{
+    alias: 'alias',
+    demand: true
+  })
+  .options('n',{
+    demand: true,
+    alias: 'index'
+  })
+  .options('u',{
+    alias:'url',
+    demand: true
+  })
+  .parse(argv);
+}
+
+// use as cli if not 'required'
+if (!module.parent) {
+
+  rotateAlias(process.argv);
+}
+
+module.exports = rotateAlias
